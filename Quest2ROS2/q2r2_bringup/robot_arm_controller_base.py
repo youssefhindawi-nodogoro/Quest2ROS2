@@ -158,31 +158,6 @@ class BaseArmController(Node):
             current_z = transform.transform.translation.z
             current_orientation = transform.transform.rotation
 
-            # # Apply fixed orientation correction:
-            # # quaternion_from_euler(0.0, pi/2, pi)
-            # q_current_np = np.array([
-            #     current_orientation.x,
-            #     current_orientation.y,
-            #     current_orientation.z,
-            #     current_orientation.w
-            # ])
-            # q_correction_np = tf_transformations.quaternion_from_euler(0.0, np.pi / 2.0, 0.0)
-            # q_current_transformed_np = tf_transformations.quaternion_multiply(q_correction_np, q_current_np)
-
-            # q_current_norm = np.linalg.norm(q_current_transformed_np)
-            # if q_current_norm < 1e-9:
-            #     self.get_logger().warning(
-            #         f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
-            #         "Current robot orientation correction produced near-zero quaternion."
-            #     )
-            #     return None, None
-            # q_current_transformed_np /= q_current_norm
-
-            # current_orientation.x = q_current_transformed_np[0]
-            # current_orientation.y = q_current_transformed_np[1]
-            # current_orientation.z = q_current_transformed_np[2]
-            # current_orientation.w = q_current_transformed_np[3]
-
             self.current_robot_pose = (current_x, current_y, current_z)
             return (current_x, current_y, current_z), current_orientation
         except Exception as e:
@@ -240,30 +215,6 @@ class BaseArmController(Node):
         Computes a robot target pose based on the robot's initial pose (anchor)
         and the hand's relative motion since that anchor.
         """
-        # # Apply a fixed orientation correction to all incoming Quest poses:
-        # # roll = 0 deg, pitch = +90 deg, yaw = +180 deg.
-        # q_input_np = np.array([
-        #     pose_stamped.pose.orientation.x,
-        #     pose_stamped.pose.orientation.y,
-        #     pose_stamped.pose.orientation.z,
-        #     pose_stamped.pose.orientation.w
-        # ])
-        # q_correction_np = tf_transformations.quaternion_from_euler(0.0, np.pi / 2.0, 0.0)
-        # q_corrected_np = tf_transformations.quaternion_multiply(q_correction_np, q_input_np)
-
-        # q_corrected_norm = np.linalg.norm(q_corrected_np)
-        # if q_corrected_norm < 1e-9:
-        #     self.get_logger().warning(
-        #         f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
-        #         "Incoming orientation correction produced near-zero quaternion; skipping this sample."
-        #     )
-        #     return
-        # q_corrected_np /= q_corrected_norm
-
-        # pose_stamped.pose.orientation.x = q_corrected_np[0]
-        # pose_stamped.pose.orientation.y = q_corrected_np[1]
-        # pose_stamped.pose.orientation.z = q_corrected_np[2]
-        # pose_stamped.pose.orientation.w = q_corrected_np[3]
 
         # Always store the last received pose (for potential re-anchoring)
         self.last_pose_stamped_always = pose_stamped
