@@ -322,11 +322,11 @@ class BaseArmController(Node):
 
         if self.is_gripper_closed:
             goal_msg.command.position = 0.0 # 0.0 Fully open
-            goal_msg.command.max_effort = 5.0 
+            goal_msg.command.max_effort = 0.1 
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to open gripper...")
         else:
-            goal_msg.command.position = 0.05 # 0.05 Fully closed
-            goal_msg.command.max_effort = 5.0 
+            goal_msg.command.position = 0.025 # 0.05 Fully closed
+            goal_msg.command.max_effort = 0.1 
             self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to close gripper...")
 
         # Send goal and update state
