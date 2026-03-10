@@ -3,7 +3,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Quaternion, Pose, TransformStamped, Point
 from quest2ros.msg import OVR2ROSInputs
 from visualization_msgs.msg import Marker
-from std_msgs.msg import ColorRGBA
+from std_msgs.msg import ColorRGBA, Bool
 from tf2_ros import TransformListener, Buffer
 import numpy as np
 import tf_transformations
@@ -88,6 +88,18 @@ class BaseArmController(Node):
         self.current_robot_pose = None  # Current EEF position (from TF)
         self.allow_pose_update = True   # Enable/disable arm motion (toggled in inputs callback)
         self.is_gripper_closed = False  # Gripper state
+        self._gripper_command_in_progress = False
+        self._gripper_step_timer = None
+        self._pending_gripper_positions = []
+        self._pending_gripper_closed_state = None
+        self.gripper_open_position = 0.044
+        self.gripper_closed_position = 0.010
+        self.gripper_max_effort = 0.1
+        self.gripper_close_steps = 6
+        self.gripper_step_delay_sec = 0.12
+        self.index_press_threshold = 0.99
+        self.button_hold_duration_sec = 0.25
+        self.button_hold_duration_ns = int(self.button_hold_duration_sec * 1e9)
         
     def _init_interfaces(self):
         #Initialize publisher,subscriber,TF,gripper
@@ -125,6 +137,7 @@ class BaseArmController(Node):
         #Publisher
         self.marker_pub = self.create_publisher(Marker, '/visualization_marker', 10)
         self.target_pose_publisher = self.create_publisher(PoseStamped, self.robot_target_pose_topic, 10)
+        self.recording_command_pub = self.create_publisher(Bool, '/recording/command', 10)
 
         # Gripper action client
         self.gripper_action_client = ActionClient(self, GripperCommand, self.gripper_action_topic)
@@ -311,76 +324,230 @@ class BaseArmController(Node):
     
     def _toggle_gripper(self):
         """
-        Toggle the gripper: send an action goal to open or close it depending on
-        the current state. Updates internal state after the action completes.
+        Toggle the gripper.
+        Both closing and opening are sent as short stepped trajectories to
+        avoid sudden snap motion.
         """
+        if self._gripper_command_in_progress:
+            self.get_logger().warning(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                "Gripper command already in progress."
+            )
+            return
+
         if not self.gripper_action_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().error(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Gripper action server not available.")
             return
 
-        goal_msg = GripperCommand.Goal()
+        self._gripper_command_in_progress = True
 
         if self.is_gripper_closed:
-            goal_msg.command.position = 0.044 # 0.0 Fully open
-            goal_msg.command.max_effort = 0.1 
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to open gripper...")
+            self.get_logger().info(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                "Sending stepped goals to open gripper smoothly..."
+            )
+            stepped_positions = np.linspace(
+                self.gripper_closed_position,
+                self.gripper_open_position,
+                self.gripper_close_steps + 1
+            )[1:]
+            self._pending_gripper_closed_state = False
+            self._pending_gripper_positions = [float(pos) for pos in stepped_positions]
+            self._send_next_gripper_step()
         else:
-            goal_msg.command.position = 0.010 # 0.05 Fully closed
-            goal_msg.command.max_effort = 0.1 
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Sending goal to close gripper...")
+            self.get_logger().info(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                "Sending stepped goals to close gripper smoothly..."
+            )
+            stepped_positions = np.linspace(
+                self.gripper_open_position,
+                self.gripper_closed_position,
+                self.gripper_close_steps + 1
+            )[1:]
+            self._pending_gripper_closed_state = True
+            self._pending_gripper_positions = [float(pos) for pos in stepped_positions]
+            self._send_next_gripper_step()
 
-        # Send goal and update state
-        self.gripper_action_client.send_goal_async(goal_msg)
-        self.is_gripper_closed = not self.is_gripper_closed
+    def _send_gripper_goal(self, position: float, on_complete):
+        goal_msg = GripperCommand.Goal()
+        goal_msg.command.position = position
+        goal_msg.command.max_effort = self.gripper_max_effort
+
+        send_future = self.gripper_action_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(
+            lambda future: self._on_gripper_goal_response(future, on_complete)
+        )
+
+    def _on_gripper_goal_response(self, future, on_complete):
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                f"Failed to send gripper goal: {exc}"
+            )
+            self._abort_gripper_command()
+            return
+
+        if not goal_handle.accepted:
+            self.get_logger().warning(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                "Gripper goal rejected by server."
+            )
+            self._abort_gripper_command()
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda result: self._on_gripper_result(result, on_complete)
+        )
+
+    def _on_gripper_result(self, future, on_complete):
+        try:
+            future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                f"Gripper goal failed: {exc}"
+            )
+            self._abort_gripper_command()
+            return
+
+        on_complete()
+
+    def _send_next_gripper_step(self):
+        if not self._pending_gripper_positions:
+            if self._pending_gripper_closed_state is not None:
+                self.is_gripper_closed = self._pending_gripper_closed_state
+            gripper_state_text = "closed" if self.is_gripper_closed else "opened"
+            self._pending_gripper_closed_state = None
+            self._gripper_command_in_progress = False
+            self.get_logger().info(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                f"Gripper {gripper_state_text} (smoothed sequence complete)."
+            )
+            return
+
+        next_position = self._pending_gripper_positions.pop(0)
+        self._send_gripper_goal(next_position, self._schedule_next_gripper_step)
+
+    def _schedule_next_gripper_step(self):
+        self._clear_gripper_step_timer()
+
+        self._gripper_step_timer = self.create_timer(
+            self.gripper_step_delay_sec,
+            self._on_gripper_step_timer
+        )
+
+    def _on_gripper_step_timer(self):
+        self._clear_gripper_step_timer()
+
+        self._send_next_gripper_step()
+
+    def _abort_gripper_command(self):
+        self._pending_gripper_positions = []
+        self._pending_gripper_closed_state = None
+        self._clear_gripper_step_timer()
+        self._gripper_command_in_progress = False
+
+    def _clear_gripper_step_timer(self):
+        if self._gripper_step_timer is not None:
+            self._gripper_step_timer.cancel()
+            self.destroy_timer(self._gripper_step_timer)
+            self._gripper_step_timer = None
 
     def _inputs_callback(self, msg: OVR2ROSInputs):
         """
         Callback for Quest 3 controller inputs.
 
-        - Upper button (button_upper): toggle gripper open/close.
-        - Lower button (button_lower): toggle pose streaming on/off and recenter anchors.
+        - Upper button (button_upper): hold for 0.25s to toggle gripper open/close.
+        - Lower button (button_lower): hold for 0.25s to toggle pose streaming and recenter anchors.
         """
-        # Ensure edge-detection flags exist (one action per press)
-        if not hasattr(self, '_button_upper_pressed_state'):
-            self._button_upper_pressed_state = False
-        if not hasattr(self, '_button_lower_pressed_state'):
-            self._button_lower_pressed_state = False
+        # Ensure hold-detection and edge-detection flags exist
+        if not hasattr(self, '_button_upper_hold_start_ns'):
+            self._button_upper_hold_start_ns = None
+        if not hasattr(self, '_button_lower_hold_start_ns'):
+            self._button_lower_hold_start_ns = None
+        if not hasattr(self, '_button_upper_hold_triggered'):
+            self._button_upper_hold_triggered = False
+        if not hasattr(self, '_button_lower_hold_triggered'):
+            self._button_lower_hold_triggered = False
+        if not hasattr(self, '_index_pressed_state'):
+            self._index_pressed_state = False
 
-        # Upper button: Toggle gripper
-        if msg.button_upper and not self._button_upper_pressed_state:
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Upper button pressed. Toggling gripper...")
-            self._toggle_gripper()
-            
-        # Update upper button press state
-        self._button_upper_pressed_state = msg.button_upper
+        now_ns = self.get_clock().now().nanoseconds
 
-        # Lower button: Toggle pose updates and re-anchor
-        if msg.button_lower and not self._button_lower_pressed_state:
-            # Flip the pose-streaming gate
-            self.allow_pose_update = not self.allow_pose_update
-            
-            state_msg = "ENABLED (publishing poses)" if self.allow_pose_update else "DISABLED (hold position)"
-            self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Lower button pressed: pose streaming is now **{state_msg}**。")
-            
-            robot_pos, robot_ori = self._get_robot_current_pose()
-            
-            if self.last_pose_stamped_always is not None:
-                pass
+        # Index trigger: send recording command once per press
+        index_pressed = msg.press_index >= self.index_press_threshold
+        if index_pressed and not self._index_pressed_state:
+            recording_msg = Bool()
+            recording_msg.data = (self.arm_name == "right")
+            self.recording_command_pub.publish(recording_msg)
+            self.get_logger().info(
+                f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                f"Index pressed. Published /recording/command={recording_msg.data}"
+            )
 
-            if robot_pos is not None and robot_ori is not None:
-                # Set robot anchor to the current EEF pose
-                self.initial_position = robot_pos
-                self.initial_orientation = robot_ori
-                self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Robot anchor reset to current pose. ")
+        self._index_pressed_state = index_pressed
+
+        # Upper button: hold for 0.25 second to toggle gripper
+        if msg.button_upper:
+            if self._button_upper_hold_start_ns is None:
+                self._button_upper_hold_start_ns = now_ns
+                self._button_upper_hold_triggered = False
+            elif (
+                not self._button_upper_hold_triggered
+                and (now_ns - self._button_upper_hold_start_ns) >= self.button_hold_duration_ns
+            ):
+                self.get_logger().info(
+                    f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                    f"Upper button held for {self.button_hold_duration_sec:.2f}s. Toggling gripper..."
+                )
+                self._toggle_gripper()
+                self._button_upper_hold_triggered = True
+        else:
+            self._button_upper_hold_start_ns = None
+            self._button_upper_hold_triggered = False
+
+        # Lower button: hold for 0.25 second to toggle pose updates and re-anchor
+        if msg.button_lower:
+            if self._button_lower_hold_start_ns is None:
+                self._button_lower_hold_start_ns = now_ns
+                self._button_lower_hold_triggered = False
+            elif (
+                not self._button_lower_hold_triggered
+                and (now_ns - self._button_lower_hold_start_ns) >= self.button_hold_duration_ns
+            ):
+                self._button_lower_hold_triggered = True
+
+                # Flip the pose-streaming gate
+                self.allow_pose_update = not self.allow_pose_update
                 
-                # Force _pose_callback to re-anchor Quest on the next smoothed sample
-                self.initial_orientation = None 
-                self.first_received_quest_position = None
-                self.first_received_quest_orientation = None
+                state_msg = "ENABLED (publishing poses)" if self.allow_pose_update else "DISABLED (hold position)"
+                self.get_logger().info(
+                    f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] "
+                    f"Lower button held for {self.button_hold_duration_sec:.2f}s: pose streaming is now **{state_msg}**。"
+                )
+                
+                robot_pos, robot_ori = self._get_robot_current_pose()
+                
+                if self.last_pose_stamped_always is not None:
+                    pass
 
-            # Clear filter history
-            self.position_history.clear()
-            self.orientation_history.clear()
+                if robot_pos is not None and robot_ori is not None:
+                    # Set robot anchor to the current EEF pose
+                    self.initial_position = robot_pos
+                    self.initial_orientation = robot_ori
+                    self.get_logger().info(f"[{self.arm_name.capitalize()} {self.robot_name.upper()} Arm] Robot anchor reset to current pose. ")
+                    
+                    # Force _pose_callback to re-anchor Quest on the next smoothed sample
+                    self.initial_orientation = None 
+                    self.first_received_quest_position = None
+                    self.first_received_quest_orientation = None
 
-        # Update lower button press state
-        self._button_lower_pressed_state = msg.button_lower
+                # Clear filter history
+                self.position_history.clear()
+                self.orientation_history.clear()
+        else:
+            self._button_lower_hold_start_ns = None
+            self._button_lower_hold_triggered = False
