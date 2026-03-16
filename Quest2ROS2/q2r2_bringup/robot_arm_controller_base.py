@@ -63,6 +63,11 @@ class BaseArmController(Node):
         self._init_variables()
         self._init_interfaces()
         
+        # Start in disabled state (hold position)
+        self.allow_pose_update = False
+        # Initially close the gripper
+        self._toggle_gripper()
+        
         self.commanded_trajectory_x = []
         self.commanded_trajectory_y = []
         self.commanded_trajectory_z = []
@@ -93,7 +98,9 @@ class BaseArmController(Node):
         self._pending_gripper_positions = []
         self._pending_gripper_closed_state = None
         self.gripper_open_position = 0.044
-        self.gripper_closed_position = 0.010
+        self.gripper_closed_position = 0.0
+        self.gripper_closed_position_bottle = 0.010
+
         self.gripper_max_effort = 0.1
         self.gripper_close_steps = 6
         self.gripper_step_delay_sec = 0.12
