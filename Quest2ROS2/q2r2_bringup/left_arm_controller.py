@@ -10,8 +10,8 @@ class LeftArmController(BaseArmController):
             base_frame_id = "openarm_body_link0", # The root reference frame for all robot movements (World Frame).
             filter_window_size = 20,# Size of the moving average filter
             end_effector_link_name = "openarm_left_hand",# The name of the specific link we want to control/move.
-            ctrl_prefix = "/follower/left_cartesian_motion_controller",# Name for the robot's inverse kinematics controller, includes the namespace
-            gripper_action_topic = "/follower/left_gripper_controller/gripper_cmd"# The Action Server topic for opening/closing the gripper, includes the namespace
+            ctrl_prefix = "/left_cartesian_motion_controller",# Name for the robot's inverse kinematics controller, includes the namespace
+            gripper_action_topic = "/left_gripper_controller/gripper_cmd"# The Action Server topic for opening/closing the gripper, includes the namespace
         )                            
 
 def main(args=None):
